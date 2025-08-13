@@ -1,241 +1,179 @@
+# app.py
 import os
-import time
 import json
 import logging
-import threading
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from flask import Flask, request, jsonify, Response, g
+from flask import Flask, request, jsonify, Response
 
-# ----------------- 로깅 -----------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
+# ----------------- Logging -----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler()]
+)
 log = logging.getLogger("kakao-skill")
 
-# ----------------- 앱 -----------------
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 1_048_576
-app.config.update(JSON_AS_ASCII=False)
+# ----------------- Env -----------------
+CHATLING_API_KEY = os.getenv("CHATLING_API_KEY", "").strip()
+CHATLING_URL = os.getenv(
+    "CHATLING_URL",
+    # 안전장치: 혹시 비워놨다면 기본값을 챗봇ID 자리 표시로 둡니다(배포 전 꼭 교체됨)
+    "https://api.chatling.ai/v2/chatbots/9226872959/ai/kb/chat"
+).strip()
+# v2는 반드시 model id(숫자)가 필요
+CHATLING_MODEL_ID_RAW = os.getenv("CHATLING_MODEL_ID", "").strip()
+CHATLING_TIMEOUT = float(os.getenv("CHATLING_TIMEOUT", "4.2"))
 
-# ----------------- 환경변수 -----------------
-API_KEY = (os.getenv("CHATLING_API_KEY") or "").strip()
-CHATLING_URL = (os.getenv("CHATLING_URL") or "https://api.chatling.ai/v1/respond").strip()
-# /v2/면 기본 body key를 query로, 아니면 message로
-CHATLING_BODY_KEY = os.getenv("CHATLING_BODY_KEY", "query" if "/v2/" in CHATLING_URL else "message")
+try:
+    CHATLING_MODEL_ID = int(CHATLING_MODEL_ID_RAW) if CHATLING_MODEL_ID_RAW else None
+except ValueError:
+    CHATLING_MODEL_ID = None
 
-# 동기(5초 룰) 예산/재시도
-SYNC_BUDGET_S = float(os.getenv("SYNC_BUDGET_S", "4.2"))           # 전체 예산
-CHATLING_TIMEOUT = float(os.getenv("CHATLING_TIMEOUT", "1.2"))      # 1회 시도 타임아웃
-CHATLING_RETRIES_SYNC = int(os.getenv("CHATLING_RETRIES_SYNC", "3"))# 동기 재시도 횟수
+# v2 규격: 본문 키는 'message' 고정 (환경변수로 바꾸지 않음)
+V2_BODY_KEY = "message"
 
-# 콜백(백그라운드) 예산/재시도
-BG_BUDGET_S = float(os.getenv("CHATLING_BG_BUDGET_S", "20.0"))      # 전체 예산
-BG_TRY_TIMEOUT = float(os.getenv("CHATLING_BG_TIMEOUT", "6.0"))     # 1회 시도 타임아웃
-BG_SLEEP_BASE = float(os.getenv("CHATLING_BG_SLEEP_BASE", "0.35"))  # 백오프 시작 슬립
-WAIT_TEXT = os.getenv("WAIT_TEXT", "답을 찾는 중이에요… 잠시만 기다려 주세요!")
+# Kakao 표준 응답
+def kakao_text(text: str, status: int = 200) -> Response:
+    body = {
+        "version": "2.0",
+        "template": {
+            "outputs": [
+                {"simpleText": {"text": text}}
+            ]
+        }
+    }
+    return Response(json.dumps(body, ensure_ascii=False), status, mimetype="application/json; charset=utf-8")
 
-# 선택: 식별자
-CHATLING_BOT_ID = os.getenv("CHATLING_BOT_ID")
-CHATLING_SOURCE_ID = os.getenv("CHATLING_SOURCE_ID")
-
-# ----------------- HTTP 세션(커넥션 풀 + 네트워크 오류 재시도) -----------------
+# ----------------- HTTP session -----------------
 _session = requests.Session()
-_retry = Retry(
-    total=0,                 # 상태코드 재시도는 수동으로 함
-    connect=2,               # 연결 오류는 2회 정도 내부 재시도
-    read=0,
-    status=0,
-    backoff_factor=0.2,
-    allowed_methods=frozenset(["GET", "POST"]),
-    raise_on_status=False,
-)
-_adapter = HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=50)
-_session.mount("http://", _adapter)
-_session.mount("https://", _adapter)
+_session.headers.update({
+    "Authorization": f"Bearer {CHATLING_API_KEY}" if CHATLING_API_KEY else "",
+    "Content-Type": "application/json",
+})
 
-# ----------------- 진단용 상태 -----------------
-last_chatling: Dict[str, Any] = {
-    "ok": False, "status": None, "body_snippet": None, "error": None, "url": CHATLING_URL
-}
-last_request: Dict[str, Any] = {
-    "utter": None, "source": None, "raw_usrtext": None, "raw_utterance": None
-}
+# 상태 저장(간단 진단용)
+_last_chatling: Dict[str, Any] = {}
+_last_request: Dict[str, Any] = {}
 
-# ----------------- 유틸 -----------------
-def kakao_text(text: str) -> Response:
-    return jsonify({"version": "2.0", "template": {"outputs": [{"simpleText": {"text": text or ""}}]}})
+app = Flask(__name__)
 
-def _is_token(v: Optional[str]) -> bool:
-    return isinstance(v, str) and v.strip().startswith("@")
-
-def _resolve_utter(data: Dict[str, Any]) -> str:
-    params = (data.get("action") or {}).get("params") or {}
-    usrtext = (params.get("usrtext") or "").strip()
-    utter_req = ((data.get("userRequest") or {}).get("utterance") or "").strip()
-    last_request.update({"raw_usrtext": usrtext, "raw_utterance": utter_req})
-
-    if usrtext and not _is_token(usrtext):
-        last_request["source"] = "usrtext";    return usrtext
-    if utter_req and not _is_token(utter_req):
-        last_request["source"] = "userRequest.utterance";  return utter_req
-    if utter_req:  # 토큰일 때도 일단 전달
-        last_request["source"] = "userRequest.utterance(token)";  return utter_req
-    last_request["source"] = "usrtext(token/empty)";  return usrtext
-
-def _extract_answer(js: Dict[str, Any]) -> Optional[str]:
-    for k in ("answer","response","message","output","reply","text","content","result"):
-        v = js.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    data = js.get("data")
-    if isinstance(data, dict):
-        for k in ("answer","response","message","output","reply","text","content","result"):
-            v = data.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-    try:
-        return js["choices"][0]["message"]["content"].strip()
-    except Exception:
-        return None
-
-def _payload_for(utter: str) -> Dict[str, Any]:
-    p: Dict[str, Any] = {CHATLING_BODY_KEY: utter}
-    if CHATLING_BOT_ID: p["botId"] = CHATLING_BOT_ID
-    if CHATLING_SOURCE_ID: p["sourceId"] = CHATLING_SOURCE_ID
-    return p
-
-def _post_chatling(utter: str, timeout_s: float) -> Optional[str]:
-    # 마지막 호출 정보 초기화
-    last_chatling.update({"ok": False, "status": None, "body_snippet": None, "error": None, "url": CHATLING_URL})
-    if not API_KEY:
-        last_chatling["error"] = "no_api_key";   return None
-    if not utter:
-        last_chatling["error"] = "empty_utter";  return None
-
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    if API_KEY: headers["Authorization"] = f"Bearer {API_KEY}"
-
-    try:
-        r = _session.post(CHATLING_URL, headers=headers, json=_payload_for(utter), timeout=timeout_s)
-        last_chatling.update({
-            "ok": r.ok,
-            "status": r.status_code,
-            "body_snippet": (r.text[:300] if isinstance(r.text, str) else None),
-        })
-        if r.ok:
-            try:
-                js = r.json()
-            except Exception:
-                return None
-            return _extract_answer(js)
-        return None
-    except Exception as e:
-        last_chatling.update({"error": repr(e)})
-        log.warning("chatling exception: %s", e)
-        return None
-
-def ask_chatling_sync(utter: str) -> Optional[str]:
-    """5초 룰 안에서 여러 번 시도 (총 예산 SYNC_BUDGET_S)"""
-    deadline = time.time() + SYNC_BUDGET_S
-    attempt = 0
-    while attempt < CHATLING_RETRIES_SYNC:
-        remaining = deadline - time.time()
-        if remaining <= 0: break
-        timeout = min(max(0.2, CHATLING_TIMEOUT), remaining)
-        ans = _post_chatling(utter, timeout)
-        if ans: return ans
-        attempt += 1
-        time.sleep(min(0.15 * attempt, 0.6))  # 짧은 백오프
-    return None
-
-def ask_chatling_bg(utter: str) -> str:
-    """백그라운드 장시간 재시도 (총 예산 BG_BUDGET_S) — 성공 텍스트 또는 최종 폴백 문구 반환"""
-    deadline = time.time() + BG_BUDGET_S
-    attempt = 0
-    sleep = BG_SLEEP_BASE
-    while time.time() < deadline:
-        remaining = deadline - time.time()
-        timeout = min(BG_TRY_TIMEOUT, max(0.5, remaining))
-        ans = _post_chatling(utter, timeout)
-        if ans: return ans
-        attempt += 1
-        time.sleep(min(sleep, 2.0))
-        sleep *= 1.6  # 지수 백오프
-    return "지금은 답변 서버가 혼잡해요. 잠시 뒤에 다시 시도해 주세요."
-
-def _send_callback(cb_url: str, text: str):
-    try:
-        body = {"version": "2.0", "template": {"outputs": [{"simpleText": {"text": text}}]}}
-        r = _session.post(cb_url, json=body, timeout=5)
-        log.info("callback status=%s", r.status_code)
-    except Exception as e:
-        log.warning("callback failed: %s", e)
-
-# ----------------- 미들웨어 로그 -----------------
-@app.before_request
-def _t0(): g.t0 = time.time()
-
-@app.after_request
-def _after(resp: Response):
-    try:
-        took = int((time.time() - getattr(g, "t0", time.time())) * 1000)
-        log.info("path=%s method=%s status=%s took_ms=%s", request.path, request.method, resp.status_code, took)
-    except Exception:
-        pass
-    return resp
-
-@app.errorhandler(Exception)
-def _err(e):
-    log.exception("Unhandled error")
-    return kakao_text("일시적 오류가 있었지만 연결은 유지되었습니다."), 200
-
-# ----------------- 헬스/진단 -----------------
+# ----------------- Health -----------------
 @app.get("/")
-def root_ok(): return Response(b"ok", 200, {"Content-Type": "text/plain"})
-
 @app.get("/healthz")
-def healthz(): return Response(b"ok", 200, {"Content-Type": "text/plain"})
+def healthz():
+    return Response(b"ok", 200)
 
+# ----------------- Diag -----------------
 @app.get("/diag")
 def diag():
+    pretty = request.args.get("pretty")
     payload = {
-        "api_key_set": bool(API_KEY),
+        "api_key_set": bool(CHATLING_API_KEY),
         "chatling_url": CHATLING_URL,
-        "body_key": CHATLING_BODY_KEY,
-        "sync_budget_s": SYNC_BUDGET_S,
-        "bg_budget_s": BG_BUDGET_S,
-        "last_chatling": last_chatling,
-        "last_request": last_request,
+        "model_id": CHATLING_MODEL_ID,
+        "body_key": V2_BODY_KEY,
+        "sync_budget_s": CHATLING_TIMEOUT,
+        "last_chatling": _last_chatling or None,
+        "last_request": _last_request or None,
     }
-    if request.args.get("pretty"):
-        return Response(json.dumps(payload, ensure_ascii=False, indent=2), mimetype="application/json")
+    if pretty:
+        return Response(json.dumps(payload, ensure_ascii=False, indent=2), 200, mimetype="application/json")
     return jsonify(payload)
 
-# ----------------- 웹훅 -----------------
-@app.route("/webhook", methods=["POST", "GET", "HEAD"])
+# ----------------- Chatling call (v2 고정) -----------------
+def call_chatling_v2(message: str) -> Optional[str]:
+    global _last_chatling
+
+    if not CHATLING_API_KEY:
+        _last_chatling = {"ok": False, "status": 0, "error": "no_api_key"}
+        return None
+    if not CHATLING_MODEL_ID:
+        _last_chatling = {"ok": False, "status": 0, "error": "no_model_id"}
+        return None
+
+    payload = {
+        V2_BODY_KEY: message,            # <-- 'message'
+        "ai_model_id": CHATLING_MODEL_ID # <-- 모델 ID(숫자)
+        # 필요 시 옵션 추가 가능: "temperature": 0, "stream": False, ...
+    }
+
+    try:
+        res = _session.post(CHATLING_URL, json=payload, timeout=CHATLING_TIMEOUT)
+        text_snippet = (res.text or "")[:200]
+        _last_chatling = {
+            "ok": res.ok,
+            "status": res.status_code,
+            "url": CHATLING_URL,
+            "body_snippet": text_snippet
+        }
+        if not res.ok:
+            log.warning("Chatling non-2xx: %s %s", res.status_code, text_snippet)
+            return None
+
+        # 응답 추출 (유연하게 처리)
+        try:
+            j = res.json()
+        except Exception:
+            # JSON이 아닐 경우 원문 일부 반환
+            return text_snippet
+
+        # 흔한 케이스: {"status":"success","data":{"response":"..."}}
+        if isinstance(j, dict):
+            data = j.get("data") if "data" in j else j
+            if isinstance(data, dict):
+                for key in ("response", "answer", "text", "message"):
+                    if key in data and isinstance(data[key], str):
+                        return data[key].strip()
+
+        # 그래도 못 뽑으면 본문 스니펫
+        return text_snippet
+    except requests.Timeout:
+        _last_chatling = {"ok": False, "status": 0, "error": "timeout"}
+        return None
+    except Exception as e:
+        _last_chatling = {"ok": False, "status": 0, "error": str(e)}
+        return None
+
+# ----------------- Kakao webhook -----------------
+@app.post("/webhook")
 def webhook():
+    global _last_request
+
+    # 기본 파싱
     data = request.get_json(silent=True) or {}
-    utter = _resolve_utter(data)
-    last_request["utter"] = utter
+    utter = (
+        (data.get("action", {}).get("params", {}).get("usrtext"))
+        or (data.get("userRequest", {}).get("utterance"))
+        or ""
+    )
+    utter = (utter or "").strip()
 
-    # 콜백 모드(있으면): 즉시 응답 후 백그라운드에서 성공할 때까지 재시도
-    callback_url = ((data.get("userRequest") or {}).get("callbackUrl"))
-    if callback_url:
-        def _worker():
-            final = ask_chatling_bg(utter)
-            _send_callback(callback_url, final)
-        threading.Thread(target=_worker, daemon=True).start()
-        return jsonify({"version": "2.0", "useCallback": True, "data": {"text": WAIT_TEXT}}), 200
+    _last_request = {
+        "utter": utter,
+        "source": "action.params.usrtext" if data.get("action", {}).get("params", {}).get("usrtext") else "userRequest.utterance",
+        "raw_usrtext": data.get("action", {}).get("params", {}).get("usrtext"),
+        "raw_utterance": data.get("userRequest", {}).get("utterance"),
+        "ts": datetime.utcnow().isoformat()
+    }
+    log.info("WEBHOOK utter='%s'", utter)
 
-    # 동기 모드: 5초 안에서 여러 번 재시도, 그래도 실패하면 고정 폴백(에코 금지)
-    reply = ask_chatling_sync(utter)
-    text = reply or "지금은 답변 서버가 느려요. 곧 다시 시도해 볼게요."
-    return kakao_text(text), 200
+    if not utter:
+        return kakao_text("질문을 입력해 주세요 🙂")
+
+    # v2 호출
+    reply = call_chatling_v2(utter)
+
+    if reply:
+        return kakao_text(reply)
+
+    # 실패/타임아웃 폴백 (카카오 5초 룰 준수)
+    return kakao_text("지금은 답변 서버가 혼잡해요. 잠시 뒤에 다시 시도해 주세요."), 200
 
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
+    log.info("running on 0.0.0.0:%s", port)
     app.run(host="0.0.0.0", port=port)

@@ -1,48 +1,66 @@
-# 상단 import 근처에 추가
-import os, time, logging, requests
+import os, time, logging
 from flask import Flask, request, jsonify, Response, g
 
-API_KEY = os.getenv("CHATLING_API_KEY")
-CHATLING_URL = os.getenv("CHATLING_URL", "https://api.chatling.ai/v1/respond")
-TIMEOUT = float(os.getenv("CHATLING_TIMEOUT", "1.8"))
-last_chatling = {"ok": False, "status": None, "body_snippet": None, "error": None}
+logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"),
+                    format="%(asctime)s | %(levelname)s | %(message)s")
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 1*1024*1024
 
-def ask_chatling(utter: str):
-    # 기록 초기화
-    last_chatling.update({"ok": False, "status": None, "body_snippet": None, "error": None})
-    if not (API_KEY and utter):
-        if not API_KEY:
-            last_chatling["error"] = "no_api_key"
-        elif not utter:
-            last_chatling["error"] = "empty_utter"
-        return None
+def kakao_text(text:str):
+    return jsonify({"version":"2.0","template":{"outputs":[{"simpleText":{"text": text or ""}}]}})
+
+@app.before_request
+def _t0(): g.t0 = time.time()
+
+@app.after_request
+def _after(r:Response):
     try:
+        took=int((time.time()-getattr(g,"t0",time.time()))*1000)
+        logging.info("path=%s method=%s status=%s took_ms=%s", request.path, request.method, r.status_code, took)
+    except: pass
+    return r
+
+@app.errorhandler(Exception)
+def _err(e):
+    logging.exception("Unhandled error on %s", request.path)
+    return kakao_text("일시적 오류가 있었지만 연결은 정상입니다."), 200
+
+# 헬스체크: /healthz 와 / 둘 다 200
+@app.get("/healthz")
+def healthz(): return Response(b"ok", 200, {"Content-Type":"text/plain"})
+
+@app.get("/")
+def root_ok(): return Response(b"ok", 200, {"Content-Type":"text/plain"})
+
+# 웹훅: 항상 카카오 v2.0 JSON 반환
+def ask_chatling(utter: str):
+    api_key = os.getenv("CHATLING_API_KEY")
+    if not (api_key and utter): return None
+    try:
+        import requests
         r = requests.post(
-            CHATLING_URL,
-            headers={
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            # ⚠️ Chatling의 실제 스키마에 맞게 필요시 body 수정
+            os.getenv("CHATLING_URL","https://api.chatling.ai/v1/respond"),
+            headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json","Accept":"application/json"},
             json={"message": utter},
-            timeout=TIMEOUT,
+            timeout=float(os.getenv("CHATLING_TIMEOUT","1.8"))
         )
-        last_chatling.update({"ok": r.ok, "status": r.status_code, "body_snippet": r.text[:200]})
         if r.ok:
             js = r.json()
-            # ⚠️ 실제 필드명에 맞게 조정 (예: js["answer"] / js["response"] / js["data"]["output"] ...)
             return js.get("answer") or js.get("response")
-    except Exception as e:
-        last_chatling["error"] = repr(e)
+    except Exception:
+        logging.exception("chatling call failed")
     return None
 
-# 최근 상태를 확인하는 엔드포인트 (키는 노출 X)
-@app.get("/diag")
-def diag():
-    return jsonify({
-        "api_key_set": bool(API_KEY),
-        "chatling_url": CHATLING_URL,
-        "timeout_s": TIMEOUT,
-        "last_chatling": last_chatling,
-    }), 200
+@app.route("/webhook", methods=["POST","GET","HEAD"])
+def webhook():
+    data = request.get_json(silent=True) or {}
+    utter = (
+        (((data.get("action") or {}).get("params") or {}).get("usrtext")) or
+        (((data.get("userRequest") or {}).get("utterance")) or "")
+    )
+    utter = (utter or "").strip()
+    reply = ask_chatling(utter)
+    return kakao_text(reply or (utter or "연결 OK")), 200
+
+if __name__=="__main__":
+    app.run("0.0.0.0", int(os.getenv("PORT",8080)))

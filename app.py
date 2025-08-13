@@ -1,18 +1,22 @@
 import os
-from flask import Flask, Response, jsonify, request
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 @app.get("/healthz")
 def healthz():
-    return Response(b"ok", 200, mimetype="text/plain")
+    return ("ok", 200, {"Content-Type": "text/plain"})
 
-@app.route("/webhook", methods=["POST","GET","HEAD"])
+@app.route("/webhook", methods=["POST", "GET", "HEAD"])
 def webhook():
-    # 연결 확인용: 요청 파싱 안 하고 항상 200 JSON
+    # 요청 형식과 무관하게 카카오 v2.0 JSON으로 즉시 200 반환
     return jsonify({
         "version": "2.0",
-        "template": {"outputs":[{"simpleText":{"text":"연결 OK"}}]}
+        "template": {
+            "outputs": [
+                {"simpleText": {"text": "연결 OK"}}
+            ]
+        }
     }), 200
 
 if __name__ == "__main__":

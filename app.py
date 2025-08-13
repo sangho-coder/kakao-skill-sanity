@@ -1,5 +1,5 @@
 import os
-from flask import Flask, Response, request, jsonify
+from flask import Flask, Response, jsonify, request
 
 app = Flask(__name__)
 
@@ -9,7 +9,7 @@ def healthz():
 
 @app.route("/webhook", methods=["POST","GET","HEAD"])
 def webhook():
-    # 카카오 연결 확인용: 요청을 보지 않아도 항상 200 JSON
+    # 연결 확인용: 요청 파싱 안 하고 항상 200 JSON
     return jsonify({
         "version": "2.0",
         "template": {"outputs":[{"simpleText":{"text":"연결 OK"}}]}

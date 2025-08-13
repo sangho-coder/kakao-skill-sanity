@@ -1,3 +1,4 @@
+# app.py (최소본)
 import os
 from flask import Flask, request, jsonify
 
@@ -9,7 +10,7 @@ def healthz():
 
 @app.route("/webhook", methods=["POST", "GET", "HEAD"])
 def webhook():
-    # 요청 형식과 무관하게 카카오 v2.0 JSON으로 즉시 200 반환
+    # 요청 형식에 상관없이 카카오 v2.0 JSON 고정 반환
     return jsonify({
         "version": "2.0",
         "template": {

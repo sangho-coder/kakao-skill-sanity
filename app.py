@@ -1,6 +1,7 @@
-import os, time, json, logging, threading
+import os, time, json, logging, threading, re, html
 from datetime import datetime
 from typing import Any, Dict, Optional
+
 import requests
 from flask import Flask, request, jsonify, Response
 
@@ -71,10 +72,48 @@ _session.headers.update({
 last_chatling: Optional[Dict[str, Any]] = None
 last_request: Optional[Dict[str, Any]] = None
 
+# ----------------- Helpers -----------------
+def to_plain_text(s: Optional[str]) -> Optional[str]:
+    """Markdown/HTML 제거 → Plain Text. 링크는 '텍스트 (URL)' 형태로 유지."""
+    if not s:
+        return s
+    s = html.unescape(s)
+
+    # 코드펜스/인라인코드 제거
+    s = re.sub(r"```[ \t]*[a-zA-Z0-9_+\-]*\n?", "", s)
+    s = s.replace("```", "")
+    s = re.sub(r"`([^`]+)`", r"\1", s)
+
+    # 볼드/이탤릭/취소선 제거
+    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
+    s = re.sub(r"\*([^*]+)\*", r"\1", s)
+    s = re.sub(r"__([^_]+)__", r"\1", s)
+    s = re.sub(r"_([^_]+)_", r"\1", s)
+    s = re.sub(r"~~([^~]+)~~", r"\1", s)
+
+    # 헤딩 기호 제거
+    s = re.sub(r"^\s{0,3}#{1,6}\s*", "", s, flags=re.M)
+
+    # 링크/이미지
+    s = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\1 (\2)", s)
+    s = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", s)
+
+    # HTML 태그 제거
+    s = re.sub(r"<[^>]+>", "", s)
+
+    # 리스트 마커 통일
+    s = re.sub(r"^\s*[-*+]\s+", "- ", s, flags=re.M)
+    s = re.sub(r"^[•▪︎●]\s*", "- ", s, flags=re.M)
+
+    # nbsp 등 공백 통일
+    s = s.replace("\u00A0", " ")
+    return s.strip()
+
 # ----------------- Flask -----------------
 app = Flask(__name__)
 
 def kakao_text(text: str, status: int = 200):
+    text = to_plain_text(text) or ""
     return jsonify({"version": "2.0",
                     "template": {"outputs": [{"simpleText": {"text": text}}]}}), status
 
@@ -145,9 +184,10 @@ def call_chatling(message: str, timeout_s: float) -> Optional[str]:
             return None
         try:
             js = r.json()
+            text = extract_answer(js) or snippet or None
         except Exception:
-            return snippet or None
-        return extract_answer(js) or snippet or None
+            text = snippet or None
+        return to_plain_text(text) if text else None
     except requests.Timeout:
         last_chatling = {"ok": False, "status": 0, "error": "timeout"}
         return None
@@ -159,6 +199,7 @@ def call_chatling(message: str, timeout_s: float) -> Optional[str]:
 def send_callback(cb_url: str, text: str, cb_token: Optional[str]):
     """카카오 콜백: 반드시 x-kakao-callback-token 포함. Chatling 세션 헤더와 분리."""
     try:
+        text = to_plain_text(text) or ""
         body = {"version":"2.0","template":{"outputs":[{"simpleText":{"text":text}}]}}
         headers = {"Content-Type":"application/json"}
         if cb_token:
@@ -372,7 +413,7 @@ def diag():
 def probe():
     q = request.args.get("q", "안녕하세요! 연결 점검입니다.")
     ans = call_chatling(q, timeout_s=4.0)
-    preview = (ans[:180] + "…") if isinstance(ans, str) and isinstance(ans, str) and len(ans) > 180 else ans
+    preview = (ans[:180] + "…") if isinstance(ans, str) and len(ans) > 180 else ans
     return jsonify({"sent": q, "ok": bool(ans), "answer_preview": preview, "last_chatling": last_chatling}), 200
 
 # ----------------- Webhook -----------------

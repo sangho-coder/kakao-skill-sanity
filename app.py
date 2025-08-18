@@ -1,7 +1,6 @@
 import os, time, json, logging, threading
 from datetime import datetime
 from typing import Any, Dict, Optional
-
 import requests
 from flask import Flask, request, jsonify, Response
 
@@ -11,7 +10,11 @@ log = logging.getLogger("kakao-skill")
 
 # ----------------- Env (Chatling) -----------------
 API_KEY = os.getenv("CHATLING_API_KEY", "").strip()
-CHATLING_URL = os.getenv("CHATLING_URL", "https://api.chatling.ai/v2/chatbots/9226872959/ai/kb/chat").strip()
+# 인천문화재단 챗봇 기본값(필요 시 환경변수 CHATLING_URL로 덮어쓰기)
+CHATLING_URL = os.getenv(
+    "CHATLING_URL",
+    "https://api.chatling.ai/v2/chatbots/9226872959/ai/kb/chat"
+).strip()
 
 MODEL_RAW = os.getenv("CHATLING_MODEL_ID", "").strip()  # 선택(없으면 빌더 기본 모델)
 MODEL_ID: Optional[int] = None
@@ -21,20 +24,26 @@ except Exception:
     MODEL_ID = None
 
 LANGUAGE_ID = int(os.getenv("CHATLING_LANGUAGE_ID", "1"))  # 한국어=1
-SYNC_TIMEOUT = float(os.getenv("CHATLING_TIMEOUT", "4.6"))  # 동기(5초 룰 고려)
-BG_BUDGET_S = float(os.getenv("CHATLING_BG_BUDGET_S", "18"))  # 콜백 총 예산
-BG_TRY_TIMEOUT = float(os.getenv("CHATLING_BG_TRY_TIMEOUT", "6.0"))  # 콜백 1회 시도 타임아웃
+
+# --- 타임아웃 정책 ---
+# 동기 응답(5초 제한 고려): 바로 대기안내만 시도 → 2s
+SYNC_TIMEOUT = float(os.getenv("CHATLING_TIMEOUT", "2.0"))
+# 콜백 총 예산(카카오 콜백 유효시간 60s보다 항상 작게): 50s
+BG_BUDGET_S = float(os.getenv("CHATLING_BG_BUDGET_S", "50"))
+# 콜백 1회 시도 read timeout: 40s
+BG_TRY_TIMEOUT = float(os.getenv("CHATLING_BG_TRY_TIMEOUT", "40.0"))
+
 WAIT_TEXT = os.getenv("WAIT_TEXT", "답을 찾는 중이에요… 잠시만요!")
 
 # ----------------- Env (Rate Limit & Ban) -----------------
-RL_PER_MIN   = int(os.getenv("RL_PER_MIN", "10"))          # 분당 허용 횟수
-RL_PER_HOUR  = int(os.getenv("RL_PER_HOUR", "200"))        # 시간당 허용 횟수
-RL_PER_DAY   = int(os.getenv("RL_PER_DAY", "1000"))        # 일일 허용 횟수
-RL_COOLDOWN_SHORT = int(os.getenv("RL_COOLDOWN_SHORT", "600"))   # 1차 제한(초) 기본 10분
-RL_BAN_DAYS       = int(os.getenv("RL_BAN_DAYS", "30"))          # 재위반 시 장기 차단(일)
-RL_STRIKE_WINDOW_DAYS = int(os.getenv("RL_STRIKE_WINDOW_DAYS", "7"))  # 스트라이크 유지 기간(일)
-SPAM_BURST_N = int(os.getenv("SPAM_BURST_N", "10"))        # 매우 짧은 시간 내 허용 최대 횟수
-SPAM_BURST_S = float(os.getenv("SPAM_BURST_S", "2.0"))     # 버스트 윈도우(초)
+RL_PER_MIN   = int(os.getenv("RL_PER_MIN", "10"))
+RL_PER_HOUR  = int(os.getenv("RL_PER_HOUR", "200"))
+RL_PER_DAY   = int(os.getenv("RL_PER_DAY", "1000"))
+RL_COOLDOWN_SHORT = int(os.getenv("RL_COOLDOWN_SHORT", "600"))
+RL_BAN_DAYS       = int(os.getenv("RL_BAN_DAYS", "30"))
+RL_STRIKE_WINDOW_DAYS = int(os.getenv("RL_STRIKE_WINDOW_DAYS", "7"))
+SPAM_BURST_N = int(os.getenv("SPAM_BURST_N", "10"))
+SPAM_BURST_S = float(os.getenv("SPAM_BURST_S", "2.0"))
 
 # 선택: Redis (분산 환경 권장)
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
@@ -50,6 +59,7 @@ if REDIS_URL:
         _redis = None
 
 # ----------------- HTTP -----------------
+# Chatling 호출용 세션(Authorization 포함)
 _session = requests.Session()
 _session.headers.update({
     "Authorization": f"Bearer {API_KEY}" if API_KEY else "",
@@ -65,18 +75,28 @@ last_request: Optional[Dict[str, Any]] = None
 app = Flask(__name__)
 
 def kakao_text(text: str, status: int = 200):
-    return jsonify({"version": "2.0", "template": {"outputs": [{"simpleText": {"text": text}}]}}), status
+    return jsonify({"version": "2.0",
+                    "template": {"outputs": [{"simpleText": {"text": text}}]}}), status
+
+def _get(d: Dict[str, Any], *path) -> Optional[Any]:
+    cur = d
+    for k in path:
+        if isinstance(cur, dict) and k in cur:
+            cur = cur[k]
+        else:
+            return None
+    return cur
 
 def pick_utter(payload: Dict[str, Any]) -> Optional[str]:
-    """@text 같은 리터럴 토큰은 버리고 실제 텍스트만 선택"""
+    """@text 같은 리터럴 토큰 제거 후 실제 텍스트 선택"""
     def clean(v):
         if isinstance(v, str):
             v = v.strip()
             if v and v != "@text":
                 return v
         return None
-    u1 = clean((payload.get("action") or {}).get("params", {}).get("usrtext"))
-    u2 = clean((payload.get("userRequest") or {}).get("utterance"))
+    u1 = clean(_get(payload, "action", "params", "usrtext"))
+    u2 = clean(_get(payload, "userRequest", "utterance"))
     return u1 or u2
 
 def extract_answer(js: Any) -> Optional[str]:
@@ -91,15 +111,15 @@ def extract_answer(js: Any) -> Optional[str]:
                 v = data.get(k)
                 if isinstance(v, str) and v.strip():
                     return v.strip()
-        # OpenAI 스타일
         try:
-            return js["choices"][0]["message"]["content"].strip()
+            return js["choices"][0]["message"]["content"].strip()  # OpenAI 스타일
         except Exception:
             pass
     elif isinstance(js, list):
         for item in js:
             a = extract_answer(item)
-            if a: return a
+            if a:
+                return a
     return None
 
 def call_chatling(message: str, timeout_s: float) -> Optional[str]:
@@ -118,7 +138,8 @@ def call_chatling(message: str, timeout_s: float) -> Optional[str]:
         r = _session.post(CHATLING_URL, data=json.dumps(payload), timeout=timeout_s)
         took = int((time.time() - t0) * 1000)
         snippet = (r.text or "")[:400]
-        last_chatling = {"ok": r.ok, "status": r.status_code, "took_ms": took, "url": CHATLING_URL, "body_snippet": snippet}
+        last_chatling = {"ok": r.ok, "status": r.status_code, "took_ms": took,
+                         "url": CHATLING_URL, "body_snippet": snippet}
         log.info("chatling status=%s took_ms=%s", r.status_code, took)
         if not r.ok:
             return None
@@ -135,30 +156,33 @@ def call_chatling(message: str, timeout_s: float) -> Optional[str]:
         log.exception("chatling call failed")
         return None
 
-def send_callback(cb_url: str, text: str):
+def send_callback(cb_url: str, text: str, cb_token: Optional[str]):
+    """카카오 콜백: 반드시 x-kakao-callback-token 포함. Chatling 세션 헤더와 분리."""
     try:
         body = {"version":"2.0","template":{"outputs":[{"simpleText":{"text":text}}]}}
-        r = _session.post(cb_url, json=body, timeout=5)
+        headers = {"Content-Type":"application/json"}
+        if cb_token:
+            headers["x-kakao-callback-token"] = cb_token
+        r = requests.post(cb_url, json=body, headers=headers, timeout=(2, 10))
         log.info("callback status=%s", r.status_code)
     except Exception as e:
         log.warning("callback failed: %s", e)
 
-def bg_worker(callback_url: str, utter: str):
-    """콜백 모드: 예산 내에서 반복 시도"""
-    deadline = time.time() + BG_BUDGET_S
+def bg_worker(callback_url: str, cb_token: Optional[str], utter: str):
+    """콜백 모드: 예산 내에서 반복 시도 → 50s 이내 1회 콜백"""
+    deadline = time.time() + min(BG_BUDGET_S, 50)
     sleep = 0.35
     result = None
     while time.time() < deadline:
-        result = call_chatling(utter, timeout_s=min(BG_TRY_TIMEOUT, deadline - time.time()))
+        result = call_chatling(utter, timeout_s=min(BG_TRY_TIMEOUT, max(0.1, deadline - time.time())))
         if result:
             break
         time.sleep(min(sleep, 2.0))
         sleep *= 1.6
-    send_callback(callback_url, result or "지금은 답변 서버가 혼잡해요. 잠시 뒤에 다시 시도해 주세요.")
+    send_callback(callback_url, result or "지금은 답변 서버가 혼잡해요. 잠시 뒤에 다시 시도해 주세요.", cb_token)
 
 # ----------------- Rate Limit / Ban (per-user) -----------------
 from collections import defaultdict
-
 _mem_buckets = defaultdict(lambda: {
     "ban_exp": 0,
     "burst": [],
@@ -188,13 +212,12 @@ def _incr_mem_bucket(bkt: dict, window_s: int) -> int:
     return bkt["count"]
 
 def _redis_incr_with_ttl(key: str, window_s: int) -> int:
-    """해당 key를 INCR하고 TTL을 window_s로(최초 생성시) 설정, 현재 카운트 반환"""
     assert _redis is not None
     pipe = _redis.pipeline()
     pipe.incr(key, 1)
     pipe.ttl(key)
     cnt, ttl = pipe.execute()
-    if ttl in (-1, -2):  # no ttl / not exist
+    if ttl in (-1, -2):
         _redis.expire(key, window_s)
     return int(cnt)
 
@@ -216,13 +239,6 @@ def _redis_get_int(key: str, default: int = 0) -> int:
         return default
 
 def rate_limit_check_and_message(user_id: str):
-    """
-    반환: (allowed: bool, message: Optional[str])
-    allowed=False이면 message를 그대로 사용자에게 응답하세요.
-    로직: 1) 기존 장기/단기 차단 여부 확인
-         2) 버스트 탐지(아주 짧은 시간 내 과다 요청)
-         3) 분/시간/일 한도 초과 시 1차 쿨다운, 재위반 시 30일 차단
-    """
     now = int(time.time())
 
     # 0) 기존 차단 여부 확인
@@ -282,7 +298,6 @@ def rate_limit_check_and_message(user_id: str):
 
     # 2) 분/시간/일 한도
     if _redis:
-        # minute
         if _redis_incr_with_ttl(f"m:{user_id}", 60) > RL_PER_MIN:
             strikes_key = f"str:{user_id}"
             strikes = _redis_get_int(strikes_key, 0) + 1
@@ -295,13 +310,11 @@ def rate_limit_check_and_message(user_id: str):
                 return False, (f"요청이 많아 이용이 잠시 제한되었어요. "
                                f"{_fmt_remain_ko(RL_COOLDOWN_SHORT)} 후 다시 이용해 주세요. "
                                "같은 현상이 반복되면 최대 30일 동안 이용이 제한될 수 있어요.")
-        # hour
         if _redis_incr_with_ttl(f"h:{user_id}", 3600) > RL_PER_HOUR:
             _redis_setex(f"ban:{user_id}", RL_COOLDOWN_SHORT, "1")
             return False, (f"시간당 이용 한도에 도달했어요. "
                            f"{_fmt_remain_ko(RL_COOLDOWN_SHORT)} 후 다시 이용해 주세요. "
                            "같은 현상이 반복되면 최대 30일 동안 이용이 제한될 수 있어요.")
-        # day
         if _redis_incr_with_ttl(f"d:{user_id}", 86400) > RL_PER_DAY:
             _redis_setex(f"ban:{user_id}", RL_BAN_DAYS*86400, "1")
             return False, "일일 이용 한도를 초과했어요. 30일 동안 이용이 제한될 수 있어요."
@@ -351,15 +364,15 @@ def diag():
         "last_request": last_request,
     }
     if pretty:
-        return Response(json.dumps(body, ensure_ascii=False, indent=2), 200, {"Content-Type": "application/json"})
+        return Response(json.dumps(body, ensure_ascii=False, indent=2),
+                        200, {"Content-Type": "application/json"})
     return jsonify(body)
 
 @app.get("/probe")
 def probe():
-    """브라우저에서 바로 Chatling 연결 점검: /probe?q=안녕"""
     q = request.args.get("q", "안녕하세요! 연결 점검입니다.")
     ans = call_chatling(q, timeout_s=4.0)
-    preview = (ans[:180] + "…") if isinstance(ans, str) and len(ans) > 180 else ans
+    preview = (ans[:180] + "…") if isinstance(ans, str) and isinstance(ans, str) and len(ans) > 180 else ans
     return jsonify({"sent": q, "ok": bool(ans), "answer_preview": preview, "last_chatling": last_chatling}), 200
 
 # ----------------- Webhook -----------------
@@ -368,10 +381,10 @@ def webhook():
     global last_request
     data = request.get_json(silent=True) or {}
 
-    # 사용자 식별자(채널 기준 고유 키)
-    user_id = ((data.get("userRequest") or {}).get("user") or {}).get("id", "anon")
+    # 사용자 식별자
+    user_id = _get(data, "userRequest", "user", "id") or "anon"
 
-    # 레이트리밋/차단 체크 (허용되지 않으면 즉시 안내 후 종료)
+    # 레이트리밋/차단
     allowed, msg = rate_limit_check_and_message(user_id)
     if not allowed:
         return kakao_text(msg)
@@ -380,21 +393,24 @@ def webhook():
     last_request = {
         "user_id": user_id,
         "utter": utter if utter else "(none)",
-        "raw_usrtext": (data.get("action") or {}).get("params", {}).get("usrtext"),
-        "raw_utterance": (data.get("userRequest") or {}).get("utterance"),
+        "raw_usrtext": _get(data, "action", "params", "usrtext"),
+        "raw_utterance": _get(data, "userRequest", "utterance"),
+        "has_callback": bool(_get(data, "userRequest", "callbackUrl")),
         "ts": datetime.utcnow().isoformat(),
     }
 
     if not utter:
         return kakao_text("무슨 말씀인지 조금만 더 자세히 알려주세요 🙂")
 
-    # 콜백 모드: 카카오가 callbackUrl을 줄 경우
-    callback_url = (data.get("userRequest") or {}).get("callbackUrl")
+    # 콜백 모드
+    callback_url = _get(data, "userRequest", "callbackUrl")
+    cb_token = request.headers.get("x-kakao-callback-token")
     if callback_url:
-        threading.Thread(target=bg_worker, args=(callback_url, utter), daemon=True).start()
+        log.info("callback mode: useCallback=True → final will be sent via callback within 50s")
+        threading.Thread(target=bg_worker, args=(callback_url, cb_token, utter), daemon=True).start()
         return jsonify({"version": "2.0", "useCallback": True, "data": {"text": WAIT_TEXT}}), 200
 
-    # 동기 모드: 5초 안에서 바로 시도
+    # 동기 모드
     ans = call_chatling(utter, timeout_s=SYNC_TIMEOUT)
     return kakao_text(ans or "지금은 답변 서버가 혼잡해요. 잠시 뒤에 다시 시도해 주세요.")
 
